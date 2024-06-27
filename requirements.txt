@@ -1,0 +1,4 @@
+requests==2.26.0
+python-telegram-bot==20.6
+pycoingecko==2.2.0
+pymongo[srv]
