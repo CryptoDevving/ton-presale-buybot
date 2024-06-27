@@ -1,32 +1,37 @@
 import os
 import requests
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaAnimation
 from pycoingecko import CoinGeckoAPI
 from pymongo import MongoClient
+from cachetools import TTLCache
 
 # Configuración del bot y la dirección de TON
-bot_token = 'bot token here'  # Reemplaza con tu token
+bot_token = '7485087081:AAHLD5oAYytiYmgQlOBYRg7dDOMkEKDZylQ'  # Reemplaza con tu token
 ton_address = 'UQB1W1ooB95ZXfWFY-lbj29bVC0L7RCpuQ1vn5VRVvGBNwMF'  # Reemplaza con tu dirección de TON
-mongo_uri = 'mongodb url connection here (srv link)'  # Reemplaza con tu URI de MongoDB
+mongo_uri = 'mongodb+srv://rain:mellamoleonel@presale-buy-bot.n3nxa6m.mongodb.net/presale-buy-bot?retryWrites=true&w=majority'  # Reemplaza con tu URI de MongoDB
 gif_url = 'http://zyneteq.com/rain-token/wp-content/uploads/2024/06/icegif-442-1.gif'  # URL del GIF
 
 # Chainbase API Configuration
-chainbase_api_key = 'chainbase api here'  # Replace with your Chainbase API key
+chainbase_api_key = '2iSlPrev0qcJaPVMold1a1neOxo'  # Replace with your Chainbase API key
 chainbase_base_url = f"https://ton-mainnet.s.chainbase.online/{chainbase_api_key}/v1/getTransactions"
 
 bot = Bot(token=bot_token)
 cg = CoinGeckoAPI()
+
 # Configuración de MongoDB
 client = MongoClient(mongo_uri)
 db = client.get_default_database()
 collection = db['transactions']
 
+# Cache para el precio de TON
+price_cache = TTLCache(maxsize=1, ttl=60)  # Cache con TTL de 60 segundos
+
 # Función para obtener las transacciones de TON usando Chainbase API
 async def get_latest_transactions(address):
     try:
-        url = f"{chainbase_base_url}?address={address}&limit=1&lt=1&to_lt=1"
+        url = f"{chainbase_base_url}?address={address}&limit=10&lt=1&to_lt=1"
         headers = {
             'accept': 'application/json'
         }
@@ -44,6 +49,9 @@ async def get_latest_transactions(address):
 # Función para obtener el precio actual de TON en USD desde CoinGecko
 def get_ton_price():
     try:
+        if 'ton_price' in price_cache:
+            return price_cache['ton_price']
+        
         url = "https://api.coingecko.com/api/v3/simple/price"
         params = {
             "ids": "the-open-network",
@@ -56,7 +64,9 @@ def get_ton_price():
         if response.status_code == 200:
             data = response.json()
             if 'the-open-network' in data and 'usd' in data['the-open-network']:
-                return data['the-open-network']['usd']
+                ton_price = data['the-open-network']['usd']
+                price_cache['ton_price'] = ton_price
+                return ton_price
             else:
                 print("No se pudo encontrar el precio de TON en la respuesta de CoinGecko.")
                 return None
@@ -96,7 +106,7 @@ def get_total_raised():
         print(f"Error al obtener el saldo de la dirección TON: {e}")
         return None, None
 
-async def send_message_to_groups(amount_ton, amount_rain, spent_usd, ton_price, tx_id):
+async def send_message_to_groups(amount_ton, amount_rain, spent_usd, ton_price, tx_id, source):
     # Redondear el monto de RAIN a dos decimales
     amount_rain_rounded = round(amount_rain, 2)
     
@@ -107,22 +117,6 @@ async def send_message_to_groups(amount_ton, amount_rain, spent_usd, ton_price, 
             print(f"El mensaje para la transacción {tx_id} ya ha sido enviado anteriormente.")
             return
         
-        # Obtener las transacciones más recientes de TON
-        transactions = await get_latest_transactions(ton_address)
-        if not transactions:
-            print("No se encontraron transacciones recientes.")
-            return
-
-        # Procesar la última transacción
-        latest_transaction = transactions[0]
-        tx_id = latest_transaction['transaction_id']['hash']
-        in_msg = latest_transaction.get('in_msg', {})
-        if 'source' not in in_msg:
-            print(f"No se encontró el campo 'source' en el mensaje de entrada (in_msg) para tx_id {tx_id}")
-            return
-        
-        source = in_msg['source']
-
         # Obtener total recaudado
         total_usd, total_ton = get_total_raised()
         if total_usd is not None and total_ton is not None:
@@ -138,6 +132,13 @@ async def send_message_to_groups(amount_ton, amount_rain, spent_usd, ton_price, 
                    f"📊 TX Id: [View on Explorer](https://tonscan.com/transactions/{tx_id})" 
                    f"{total_raised_message}")
         
+        # Crear botones
+        keyboard = [
+            [InlineKeyboardButton("Website 🌐", url="https://zyneteq.com/rain-token"),
+             InlineKeyboardButton("$RAIN News 🗞", url="https://t.me/rain_token_news")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)  # Crear el markup de los botones
+
         # Obtener todos los chats donde el bot es administrador
         admin_chats = get_admin_chats()
         if not admin_chats:
@@ -150,8 +151,8 @@ async def send_message_to_groups(amount_ton, amount_rain, spent_usd, ton_price, 
             # Construir la URL del GIF
             gif_url = 'https://zyneteq.com/rain-token/wp-content/uploads/2024/06/icegif-442.gif'
             
-            # Enviar mensaje con GIF
-            await bot.send_animation(chat_id=chat_id, animation=gif_url, caption=message, parse_mode='Markdown')
+            # Enviar mensaje con GIF y botones
+            await bot.send_animation(chat_id=chat_id, animation=gif_url, caption=message, parse_mode='Markdown', reply_markup=reply_markup)
             
             # Guardar detalles en MongoDB junto con 'source'
             transaction_data = {
@@ -191,7 +192,20 @@ async def monitor_transactions():
 
             for tx in transactions:
                 tx_id = tx['transaction_id']['hash']
-                amount_ton = int(tx['in_msg']['value']) / 1e9  # Suponiendo que el valor está en nanoTON
+                
+                # Verificar si el tx_id ya existe en MongoDB
+                existing_transaction = collection.find_one({'tx_id': tx_id})
+                if existing_transaction:
+                    print(f"La transacción {tx_id} ya ha sido procesada anteriormente.")
+                    continue
+                
+                in_msg = tx.get('in_msg', {})
+                if 'source' not in in_msg:
+                    print(f"No se encontró el campo 'source' en el mensaje de entrada (in_msg) para tx_id {tx_id}")
+                    continue
+                
+                source = in_msg['source']
+                amount_ton = int(in_msg['value']) / 1e9  # Suponiendo que el valor está en nanoTON
                 ton_price = get_ton_price()
                 if ton_price is None:
                     print("No se pudo obtener el precio de TON. Abortando envío de mensaje.")
@@ -199,9 +213,9 @@ async def monitor_transactions():
                 
                 amount_rain = amount_ton * 15000  # Cálculo del monto en RAIN
                 spent_usd = amount_ton * ton_price
-                await send_message_to_groups(amount_ton, amount_rain, spent_usd, ton_price, tx_id)
+                await send_message_to_groups(amount_ton, amount_rain, spent_usd, ton_price, tx_id, source)
 
-            await asyncio.sleep(1)  # Revisar cada segundo
+            await asyncio.sleep(5)  # Revisar cada 5 segundos
 
         except Exception as e:
             print(f"Error en el bucle principal: {e}")
