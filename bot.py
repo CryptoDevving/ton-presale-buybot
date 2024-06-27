@@ -7,13 +7,13 @@ from pycoingecko import CoinGeckoAPI
 from pymongo import MongoClient
 
 # Configuración del bot y la dirección de TON
-bot_token = 'BOT TOKEN HERE'  # Reemplaza con tu token
+bot_token = 'bot token here'  # Reemplaza con tu token
 ton_address = 'UQB1W1ooB95ZXfWFY-lbj29bVC0L7RCpuQ1vn5VRVvGBNwMF'  # Reemplaza con tu dirección de TON
-mongo_uri = 'MONGODB URI'  # Reemplaza con tu URI de MongoDB
+mongo_uri = 'mongodb url connection here (srv link)'  # Reemplaza con tu URI de MongoDB
 gif_url = 'http://zyneteq.com/rain-token/wp-content/uploads/2024/06/icegif-442-1.gif'  # URL del GIF
 
 # Chainbase API Configuration
-chainbase_api_key = 'CHAINBASE APIKEY HERE'  # Replace with your Chainbase API key
+chainbase_api_key = 'chainbase api here'  # Replace with your Chainbase API key
 chainbase_base_url = f"https://ton-mainnet.s.chainbase.online/{chainbase_api_key}/v1/getTransactions"
 
 bot = Bot(token=bot_token)
@@ -96,17 +96,33 @@ def get_total_raised():
         print(f"Error al obtener el saldo de la dirección TON: {e}")
         return None, None
 
-async def send_message_to_groups(amount_ton, amount_rain, spent_usd, tx_id, source, ton_price):
+async def send_message_to_groups(amount_ton, amount_rain, spent_usd, ton_price, tx_id):
+    # Redondear el monto de RAIN a dos decimales
+    amount_rain_rounded = round(amount_rain, 2)
+    
     try:
-        # Redondear el monto de RAIN a dos decimales
-        amount_rain_rounded = round(amount_rain, 2)
-
         # Verificar si el tx_id ya existe en MongoDB
         existing_transaction = collection.find_one({'tx_id': tx_id})
         if existing_transaction:
             print(f"El mensaje para la transacción {tx_id} ya ha sido enviado anteriormente.")
             return
         
+        # Obtener las transacciones más recientes de TON
+        transactions = await get_latest_transactions(ton_address)
+        if not transactions:
+            print("No se encontraron transacciones recientes.")
+            return
+
+        # Procesar la última transacción
+        latest_transaction = transactions[0]
+        tx_id = latest_transaction['transaction_id']['hash']
+        in_msg = latest_transaction.get('in_msg', {})
+        if 'source' not in in_msg:
+            print(f"No se encontró el campo 'source' en el mensaje de entrada (in_msg) para tx_id {tx_id}")
+            return
+        
+        source = in_msg['source']
+
         # Obtener total recaudado
         total_usd, total_ton = get_total_raised()
         if total_usd is not None and total_ton is not None:
@@ -114,43 +130,56 @@ async def send_message_to_groups(amount_ton, amount_rain, spent_usd, tx_id, sour
         else:
             total_raised_message = "\nTotal raised: Not available at the moment"
 
-        # Construir el mensaje a enviar
         message = (f"🌧💧 *NEW PRE-SALE BUY* 🌧💧\n\n"
                    f"🏷 From Wallet: [View on Explorer](https://tonscan.com/{source})\n"
                    f"💰 Spent: ${spent_usd:.2f} ({amount_ton:.2f} TON)\n"
                    f"🌧️ Got: {amount_rain_rounded} $RAIN\n"
                    f"💲 TON Price: ${ton_price:.4f}\n"
-                   f"📊 TX Id: [View on Explorer](https://tonscan.com/transactions/{tx_id})\n" 
+                   f"📊 TX Id: [View on Explorer](https://tonscan.com/transactions/{tx_id})" 
                    f"{total_raised_message}")
-
-        # Crear botones para incluir en el mensaje
-        keyboard = [
-            [InlineKeyboardButton("Website 🌐", url="https://zyneteq.com/rain-token"),
-             InlineKeyboardButton("$RAIN News 🗞", url="https://t.me/rain_token_news")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        gif_url = 'https://zyneteq.com/rain-token/wp-content/uploads/2024/06/icegif-442.gif'
-        # Enviar mensaje a todos los chats administrados
+        
+        # Obtener todos los chats donde el bot es administrador
         admin_chats = get_admin_chats()
-        for chat_id in admin_chats:
-            await bot.send_animation(chat_id=chat_id, animation=gif_url, caption=message, parse_mode='Markdown', reply_markup=reply_markup)
-            print(f"Mensaje enviado a Telegram para la transacción {tx_id} en el chat {chat_id}")
+        if not admin_chats:
+            print("No se encontraron chats administrados.")
+            return
 
-        # Guardar detalles de la transacción en MongoDB
-        transaction_data = {
-            'amount_ton': amount_ton,
-            'amount_rain': amount_rain,
-            'spent_usd': spent_usd,
-            'ton_price': ton_price,
-            'date': datetime.now(),
-            'tx_id': tx_id,
-            'source': source  # Agregar el campo 'source' al documento
-        }
-        collection.insert_one(transaction_data)
-        print(f"Detalles de la transacción guardados en MongoDB para {tx_id}")
+        for chat_id in admin_chats:
+            print(f"Enviando mensaje al chat {chat_id}")
+            
+            # Construir la URL del GIF
+            gif_url = 'https://zyneteq.com/rain-token/wp-content/uploads/2024/06/icegif-442.gif'
+            
+            # Enviar mensaje con GIF
+            await bot.send_animation(chat_id=chat_id, animation=gif_url, caption=message, parse_mode='Markdown')
+            
+            # Guardar detalles en MongoDB junto con 'source'
+            transaction_data = {
+                'amount_ton': amount_ton,
+                'amount_rain': amount_rain,
+                'spent_usd': spent_usd,
+                'ton_price': ton_price,
+                'date': datetime.now(),
+                'tx_id': tx_id,
+                'chat_id': chat_id,
+                'source': source  # Agregar el campo 'source' al documento
+            }
+            collection.insert_one(transaction_data)
+        
+            print(f"Mensaje enviado a Telegram para la transacción {tx_id} en el chat {chat_id}")
 
     except Exception as e:
         print(f"Error al enviar mensaje a Telegram o guardar en MongoDB: {e}")
+
+# Función para obtener todos los chats donde el bot es administrador
+def get_admin_chats():
+    try:
+        admin_chats = [-1002209350662]  # Ejemplo de IDs de chat administrados
+        print(f"Chats administrados por el bot: {admin_chats}")
+        return admin_chats
+    except Exception as e:
+        print(f"Error al obtener chats administrados por el bot: {e}")
+        return []
 
 # Función principal para monitorear y enviar notificaciones de transacciones
 async def monitor_transactions():
@@ -162,7 +191,7 @@ async def monitor_transactions():
 
             for tx in transactions:
                 tx_id = tx['transaction_id']['hash']
-                amount_ton = int(tx['in_msg']['value']) / 1e9  # Convertir a TON desde nanoTON
+                amount_ton = int(tx['in_msg']['value']) / 1e9  # Suponiendo que el valor está en nanoTON
                 ton_price = get_ton_price()
                 if ton_price is None:
                     print("No se pudo obtener el precio de TON. Abortando envío de mensaje.")
@@ -170,30 +199,18 @@ async def monitor_transactions():
                 
                 amount_rain = amount_ton * 15000  # Cálculo del monto en RAIN
                 spent_usd = amount_ton * ton_price
-                in_msg = tx.get('in_msg', {})
-                if 'source' in in_msg:
-                    source = in_msg['source']
-                    await send_message_to_groups(amount_ton, amount_rain, spent_usd, tx_id, source, ton_price)
-                else:
-                    print(f"No se encontró el campo 'source' en el mensaje de entrada para tx_id {tx_id}")
+                await send_message_to_groups(amount_ton, amount_rain, spent_usd, ton_price, tx_id)
 
-            await asyncio.sleep(5)  # Esperar 5 segundos antes de revisar nuevamente
+            await asyncio.sleep(1)  # Revisar cada segundo
 
         except Exception as e:
             print(f"Error en el bucle principal: {e}")
-            await asyncio.sleep(60)  # Esperar 1 minuto antes de reintentar
+            await asyncio.sleep(60)  # Esperar un minuto antes de reintentar
 
-# Función para obtener todos los chats donde el bot es administrador (simulación)
-def get_admin_chats():
-    admin_chats = [-1002209350662]  # Ejemplo de IDs de chat administrados
-    print(f"Chats administrados por el bot: {admin_chats}")
-    return admin_chats
-
-# Función principal para ejecutar el monitoreo de transacciones
+# Ejecutar el monitor de transacciones
 async def main():
-    print("Bot is running...")
     await monitor_transactions()
 
-# Iniciar el bot y ejecutar el monitoreo de transacciones
-if __name__ == "__main__":
-    asyncio.run(main())
+# Iniciar el bot (simulación)
+print("Bot is running...")
+asyncio.run(main())
